@@ -1,0 +1,152 @@
+check Continuous Archiving and Point-in-Time Recovery (PITR) for more info.
+https://www.postgresql.org/docs/9.4/continuous-archiving.html
+https://blog.sleeplessbeastie.eu/2016/02/29/how-to-perform-postgresql-point-in-time-recovery/
+
+#In the tutorial reza@reza-MS-7732 is the master machine and reza@shakar-1 is the backup one.
+
+# Install postgresql on backup to test backup and install it on server if you want to have master & slaves.
+# Install postgresql on backup and slave servers with the version of postgresql on master server. 
+# You can find the version of your database with the below command. Run it in postgres shell (psql your_dbmane)
+select version();
+# find the ubuntu version with the command below:
+lsb_release -a;
+#install postgresql
+#Ubuntu 17.04 - 17.10
+#Version 9.6 comes with the distribution.
+sudo apt-get install postgresql-9.6
+#Ubuntu 14.04, 16.04
+sudo add-apt-repository "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -sc)-pgdg main"
+wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+sudo apt-get update
+sudo apt-get install postgresql-9.6
+
+# Login to the postgres user on master server.
+reza@reza-MS-7732:~$ sudo -i -u postgres
+# Check if there is no ~/.ssh/id_rsa.pub, Create ssh key:
+postgres@reza-MS-7732:~$ ssh-keygen -t rsa
+#Only hit enter for asked inputs
+
+
+#Use command below to copy created pulic key on the Master to Slave.
+postgres@reza-MS-7732:~$ cat ~/.ssh/id_rsa.pub | ssh slave1@IP "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >>  ~/.ssh/authorized_keys"
+#exit postgres user
+postgres@reza-MS-7732:~$ exit
+--------------------------------------------------------------------------------------------------------------------
+####### On backup server
+reza@shakar-1:~$ sudo -i -u postgres
+postgres@shakar-1:~$ mkdir -p ~/.ssh && chmod 700 ~/.ssh
+postgres@shakar-1:~$ vim ~/.ssh/authorized_keys
+ copy postgres user public key on master to this file
+postgres@shakar-1:~$ mkdir -p archive/{wal,base}
+
+
+
+
+
+####### On master
+# First of all create a dump file from dabase of master and send it to backup server or another place.
+
+Go to the postgres configuration directory '/etc/postgresql/9.6/main' and edit the postgresql.conf file with vim.
+
+cd /etc/postgresql/9.6/main/
+sudo vim postgresql.conf
+
+set the parameter in conf file with these values.
+
+wal_level = hot_standby
+archive_mode=on
+archive_command = 'rsync -azvv -e ssh %p postgres@172.16.111.112:/var/lib/postgresql/archive/wal'    #check existence of destination
+archive_timeout = 6h # Set it to 2h. for test set it to 1min
+max_wal_senders = 10
+
+-wal_level determines how much information is written to the WAL. Archive adds logging required for WAL archiving; hot_standby further adds information required to run read-only queries on a standby server
+https://www.postgresql.org/docs/9.4/runtime-config-wal.html#GUC-WAL-LEVEL
+-Turning on archive_mode will run archive_command each time a WAL segment is completed. archive_command might be anything from simple cp to rsync or aws s3 cp commands. We chose rsync.
+https://help.ubuntu.com/community/rsync
+In archive_command, %p is replaced by the path name of the file to archive, while %f is replaced by only the file name
+-If your PostgreSQL server is having a peaceful day with a low transaction rate, it may take a while to fill out one complete WAL file. It is usually a good idea to have at least one WAL file backed up every X minutes (or hours or days, according to your setup).Note that archived files that are archived early due to a forced switch are still the same length as completely full files.
+
+
+sudo systemctl restart postgresql
+echo "check if postgres is running"
+sudo netstat -plntu|grep 5432
+
+#check the db logs with 
+vim /var/log/postgresql/postgresql-x.x-main.log
+# You can find the version of your database with the below command. Run it in postgres shell (psql your_dbmane)
+select version();
+
+#notes: 
+#The name of WALs is incremental. Postgres doesn't keep all WALs. It will remove WALs after a while if "archive_commad" runs correctly for them. If "archive_command" fails postgre will keep generated #WALs. This will cause bunch of WALs on master haven't been transfered and consuming master's volum. Check status of "archive_cammand" in /var/log/postgresql/postgresql-x.x-main.log
+#If you stop postgresql, it will stop generating WALs. Maybe it will generate only one more WAL file for uncommitted transactions.
+---------------------------------------------------------------------------------------------------------------------------
+# Creating base backup on master
+
+reza@reza-MS-7732:/etc/postgresql/9.6/main$ sudo vim pg_hba.conf
+#add this line to pg_hba.conf
+host    replication    postgres             127.0.0.1/0               trust
+#restart postgresql
+reza@reza-MS-7732:/etc/postgresql/9.6/main$ sudo systemctl restart postgresql
+
+# On the master postgres user:
+postgres@reza-MS-7732:~$ mkdir archive
+postgres@reza-MS-7732:~$ mkdir archive/base
+postgres@reza-MS-7732:~$ pg_basebackup -h 127.0.0.1 -D /var/lib/postgresql/archive/base
+postgres@reza-MS-7732:~$ rsync -azvv -e ssh /var/lib/postgresql/archive/base/*  postgres@172.16.111.112:/var/lib/postgresql/archive/base  #clean destination folder befor copying data
+
+# Now you have base backup in /var/lib/postgresql/archive/base and incremental WAL files in /var/lib/postgresql/archive/wal in backup server
+
+# In disaster time it's a good idea to move the remainig wal file on master to backup server. Maybe some wal files haven't been transfered yet. 
+# Do not use rsync to copy the folder. It copies unneccessary files and folders. This will cause problem in recovery. Use scp for only wal files
+########################################################################################## restoring on backup server.
+#Check archiving process on backup server to insure there is no problem. Periodically remove old wal and base files and repeat the process of creating base file and archiving wal files. First move old files to a temporary place and when you are sure of new backup remove them.
+#restoring wal files on backup server.  
+reza@shakar-1:~$ sudo systemctl stop postgresql	
+reza@shakar-1:~$ sudo mv /var/lib/postgresql/9.6/main /var/lib/postgresql/9.6/main.before_recovery  #check destination not exists
+reza@shakar-1:~$ sudo -i -u postgres
+#Backup current database files
+
+postgres@shakar-1:~$ cp -rp ~/archive/base /var/lib/postgresql/9.6/main
+postgres@shakar-1:~$ chmod 700 /var/lib/postgresql/9.6/main
+postgres@shakar-1:~$ vim /var/lib/postgresql/9.6/main/recovery.conf
+#add to file
+restore_command = 'cp /var/lib/postgresql/archive/wal/%f %p'
+reza@shakar-1:~$ sudo systemctl start postgresql
+
+#############################################################################################
+# If you have problem in master databse and you want to restore DB from wal files on backup server, do steps below.
+# On master server
+postgres@reza-MS-7732:~$ scp -r postgres@172.16.111.112:/var/lib/postgresql/archive/base /var/lib/postgresql/restore/
+postgres@reza-MS-7732:~$ scp -r postgres@172.16.111.112:/var/lib/postgresql/archive/wal /var/lib/postgresql/restore/
+
+reza@reza-MS-7732:~$ sudo systemctl stop postgresql	
+reza@reza-MS-7732:~$ sudo mv /var/lib/postgresql/9.6/main /var/lib/postgresql/9.6/main.before_recovery  #check destination not exists
+reza@reza-MS-7732:~$ sudo -i -u postgres
+#Backup current database files
+
+postgres@reza-MS-7732:~$ cp -rp ~/restore/base /var/lib/postgresql/9.6/main
+postgres@reza-MS-7732:~$ chmod 700 /var/lib/postgresql/9.6/main
+postgres@reza-MS-7732:~$ vim /var/lib/postgresql/9.6/main/recovery.conf
+#add to file
+restore_command = 'cp /var/lib/postgresql/restore/wal/%f %p'
+reza@reza-MS-7732:~$ sudo systemctl start postgresql
+
+######################################################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
